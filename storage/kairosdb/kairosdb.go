@@ -65,6 +65,13 @@ const (
 	serFsUsage string = "fs_usage"
 )
 
+// Field names
+const (
+	fieldValue  string = "value"
+	fieldType   string = "type"
+	fieldDevice string = "device"
+)
+
 // Tag names
 const (
 	tagMachineName   string = "machine"
@@ -135,7 +142,7 @@ func (self *kairosdbStorage) AddStats(ref info.ContainerReference, stats *info.C
 		defer self.lock.Unlock()
 
 		self.points = append(self.points, self.containerStatsToPoints(ref, stats)...)
-		//self.points = append(self.points, self.containerFilesystemStatsToPoints(ref, stats)...)
+		self.points = append(self.points, self.containerFilesystemStatsToPoints(ref, stats)...)
     if self.readyToFlush() {
 			pointsToFlush = self.points
 			self.points = make([]*kairosdbMetric, 0)
@@ -154,20 +161,6 @@ func (self *kairosdbStorage) AddStats(ref info.ContainerReference, stats *info.C
       return fmt.Errorf("failed to write stats to kairosDb - %s", err)
     }
     defer resp.Body.Close()
-
-    /*
-		batchTags := map[string]string{tagMachineName: self.machineName}
-		bp := influxdb.BatchPoints{
-			Points:   points,
-			Database: self.database,
-			Tags:     batchTags,
-			Time:     stats.Timestamp,
-		}
-		response, err := self.client.Write(bp)
-		if err != nil || checkResponseForErrors(response) != nil {
-			return fmt.Errorf("failed to write stats to influxDb - %s", err)
-		}
-    */
   }
   return nil
 }
@@ -193,6 +186,34 @@ func (self *kairosdbStorage) tagPoints(ref info.ContainerReference, stats *info.
 	}
 }
 
+func (self *kairosdbStorage) containerFilesystemStatsToPoints(
+	ref info.ContainerReference,
+	stats *info.ContainerStats) (points []*kairosdbMetric) {
+	if len(stats.Filesystem) == 0 {
+		return points
+	}
+	for _, fsStat := range stats.Filesystem {
+    pointFsUsage := makePoint(serFsUsage, stats.Timestamp, int64(fsStat.Usage))
+		tagsFsUsage := map[string]string{
+			fieldDevice: fsStat.Device,
+			fieldType:   "usage",
+		}
+    addTagsToPoint(pointFsUsage, tagsFsUsage)
+
+    pointFsLimit := makePoint(serFsLimit, stats.Timestamp, int64(fsStat.Limit))
+		tagsFsLimit := map[string]string{
+			fieldDevice: fsStat.Device,
+			fieldType:   "limit",
+		}
+    addTagsToPoint(pointFsLimit, tagsFsLimit)
+
+		points = append(points, pointFsUsage, pointFsLimit)
+	}
+
+  self.tagPoints(ref, stats, points)
+
+	return points
+}
 
 func (self *kairosdbStorage) containerStatsToPoints(
 	ref info.ContainerReference,
