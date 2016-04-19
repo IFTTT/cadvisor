@@ -1,39 +1,38 @@
 package kairosdb
 
 import (
-  "fmt"
-  "encoding/json"
-  "bytes"
-  "net/http"
-  "net/url"
-  "os"
-  "sync"
-  "time"
-  info "github.com/google/cadvisor/info/v1"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/golang/glog"
+	"github.com/google/cadvisor/client"
+	info "github.com/google/cadvisor/info/v1"
 	storage "github.com/google/cadvisor/storage"
 )
 
-func init() {
-  storage.RegisterStorageDriver("kairosdb", new)
-}
-
 type kairosdbMetric struct {
-	Timestamp int64 `json:"timestamp"`
-	Name      string `json:"name"`
-	Value     interface{} `json:"value"`
+	Timestamp int64             `json:"timestamp"`
+	Name      string            `json:"name"`
+	Value     interface{}       `json:"value"`
 	Tags      map[string]string `json:"tags"`
 }
 
 type kairosdbStorage struct {
-  url *url.URL
-  httpClient *http.Client
-  headers map[string]string
-  machineName string
-  bufferDuration time.Duration
-  lastWrite time.Time
-  points []*kairosdbMetric
-  lock sync.Mutex
-  readyToFlush func() bool
+	url            *url.URL
+	httpClient     *http.Client
+	headers        map[string]string
+	machineName    string
+	bufferDuration time.Duration
+	lastWrite      time.Time
+	points         []*kairosdbMetric
+	lock           sync.Mutex
+	readyToFlush   func() bool
 }
 
 // Series names
@@ -78,6 +77,11 @@ const (
 	tagContainerName string = "container_name"
 )
 
+func init() {
+	storage.RegisterStorageDriver("kairosdb", new)
+}
+
+// KairosDB stores timestamps in milliseconds.
 func msTime(t time.Time) (ms int64) {
 	ms = t.UnixNano() / 1000000
 
@@ -97,45 +101,41 @@ func new() (storage.StorageDriver, error) {
 	)
 }
 
-func (self *kairosdbStorage) OverrideReadyToFlush(readyToFlush func() bool) {
-	self.readyToFlush = readyToFlush
+func newStorage(
+	machineName,
+	kairosdbHost string,
+	bufferDuration time.Duration,
+) (*kairosdbStorage, error) {
+	url := &url.URL{
+		Scheme: "http",
+		Host:   kairosdbHost,
+		Path:   "api/v1/datapoints",
+	}
+
+	client := &http.Client{}
+
+	ret := &kairosdbStorage{
+		url:            url,
+		httpClient:     client,
+		machineName:    machineName,
+		bufferDuration: bufferDuration,
+		lastWrite:      time.Now(),
+		points:         make([]*kairosdbMetric, 0),
+	}
+
+	ret.readyToFlush = ret.defaultReadyToFlush
+	return ret, nil
 }
 
 func (self *kairosdbStorage) defaultReadyToFlush() bool {
 	return time.Since(self.lastWrite) >= self.bufferDuration
 }
 
-func newStorage(
-  machineName,
-  kairosdbHost string,
-  bufferDuration time.Duration,
-) (*kairosdbStorage, error) {
-  url := &url.URL{
-    Scheme: "http",
-    Host:   kairosdbHost,
-    Path: "api/v1/datapoints",
-  }
-
-  client := &http.Client{}
-
-  ret := &kairosdbStorage{
-    url: url,
-    httpClient: client,
-    machineName: machineName,
-    bufferDuration: bufferDuration,
-    lastWrite: time.Now(),
-    points: make([]*kairosdbMetric, 0),
-  }
-
-  ret.readyToFlush = ret.defaultReadyToFlush
-  return ret, nil
-}
-
 func (self *kairosdbStorage) AddStats(ref info.ContainerReference, stats *info.ContainerStats) error {
 	if stats == nil {
 		return nil
 	}
-  var pointsToFlush []*kairosdbMetric
+	var pointsToFlush []*kairosdbMetric
 	func() {
 		// AddStats will be invoked simultaneously from multiple threads and only one of them will perform a write.
 		self.lock.Lock()
@@ -143,46 +143,45 @@ func (self *kairosdbStorage) AddStats(ref info.ContainerReference, stats *info.C
 
 		self.points = append(self.points, self.containerStatsToPoints(ref, stats)...)
 		self.points = append(self.points, self.containerFilesystemStatsToPoints(ref, stats)...)
-    if self.readyToFlush() {
+		if self.readyToFlush() {
 			pointsToFlush = self.points
 			self.points = make([]*kairosdbMetric, 0)
 			self.lastWrite = time.Now()
 		}
 	}()
-  if len(pointsToFlush) > 0 {
+	if len(pointsToFlush) > 0 {
 		points := make([]kairosdbMetric, len(pointsToFlush))
 		for i, p := range pointsToFlush {
 			points[i] = *p
 		}
 
-    b, _ := json.Marshal(points)
-    resp, err := self.httpClient.Post(self.url.String(), "application/json", bytes.NewBuffer(b))
-    if err != nil || resp.StatusCode != 204 {
-      return fmt.Errorf("failed to write stats to kairosDb - %s", err)
-    }
-    defer resp.Body.Close()
-  }
-  return nil
+		b, _ := json.Marshal(points)
+		resp, err := self.httpClient.Post(self.url.String(), "application/json", bytes.NewBuffer(b))
+		if err != nil || resp.StatusCode != 204 {
+			return fmt.Errorf("failed to write stats to kairosDb - %s", err)
+		}
+		defer resp.Body.Close()
+	}
+	return nil
 }
 
-// Set tags and timestamp for all points of the batch.
-// Points should inherit the tags that are set for BatchPoints, but that does not seem to work.
-func (self *kairosdbStorage) tagPoints(ref info.ContainerReference, stats *info.ContainerStats, points []*kairosdbMetric) {
-	// Use container alias if possible
-	var containerName string
-	if len(ref.Aliases) > 0 {
-		containerName = ref.Aliases[0]
-	} else {
-		containerName = ref.Name
-	}
+func (self *kairosdbStorage) Close() error {
+	self.httpClient = nil
+	return nil
+}
 
-	commonTags := map[string]string{
-		tagMachineName:   self.machineName,
-		tagContainerName: containerName,
-	}
-	for i := 0; i < len(points); i++ {
-		// merge with existing tags if any
-		addTagsToPoint(points[i], commonTags)
+func (self *kairosdbStorage) OverrideReadyToFlush(readyToFlush func() bool) {
+	self.readyToFlush = readyToFlush
+}
+
+// Adds additional tags to the existing tags of a point
+func addTagsToPoint(point *kairosdbMetric, tags map[string]string) {
+	if point.Tags == nil {
+		point.Tags = tags
+	} else {
+		for k, v := range tags {
+			point.Tags[k] = v
+		}
 	}
 }
 
@@ -193,24 +192,24 @@ func (self *kairosdbStorage) containerFilesystemStatsToPoints(
 		return points
 	}
 	for _, fsStat := range stats.Filesystem {
-    pointFsUsage := makePoint(serFsUsage, stats.Timestamp, int64(fsStat.Usage))
+		pointFsUsage := makePoint(serFsUsage, stats.Timestamp, int64(fsStat.Usage))
 		tagsFsUsage := map[string]string{
 			fieldDevice: fsStat.Device,
 			fieldType:   "usage",
 		}
-    addTagsToPoint(pointFsUsage, tagsFsUsage)
+		addTagsToPoint(pointFsUsage, tagsFsUsage)
 
-    pointFsLimit := makePoint(serFsLimit, stats.Timestamp, int64(fsStat.Limit))
+		pointFsLimit := makePoint(serFsLimit, stats.Timestamp, int64(fsStat.Limit))
 		tagsFsLimit := map[string]string{
 			fieldDevice: fsStat.Device,
 			fieldType:   "limit",
 		}
-    addTagsToPoint(pointFsLimit, tagsFsLimit)
+		addTagsToPoint(pointFsLimit, tagsFsLimit)
 
 		points = append(points, pointFsUsage, pointFsLimit)
 	}
 
-  self.tagPoints(ref, stats, points)
+	self.tagPoints(ref, stats, points)
 
 	return points
 }
@@ -228,7 +227,7 @@ func (self *kairosdbStorage) containerStatsToPoints(
 	// CPU usage: Time spent in user space (in nanoseconds)
 	points = append(points, makePoint(serCpuUsageUser, stats.Timestamp, stats.Cpu.Usage.User))
 
-  // CPU usage per CPU
+	// CPU usage per CPU
 	for i := 0; i < len(stats.Cpu.Usage.PerCpu); i++ {
 		point := makePoint(serCpuUsagePerCpu, stats.Timestamp, stats.Cpu.Usage.PerCpu[i])
 		tags := map[string]string{"instance": fmt.Sprintf("%v", i)}
@@ -252,32 +251,52 @@ func (self *kairosdbStorage) containerStatsToPoints(
 	points = append(points, makePoint(serTxBytes, stats.Timestamp, stats.Network.TxBytes))
 	points = append(points, makePoint(serTxErrors, stats.Timestamp, stats.Network.TxErrors))
 
-  self.tagPoints(ref, stats, points)
+	self.tagPoints(ref, stats, points)
 
-  return points
+	return points
 }
 
 // Creates a measurement point with a single value field
 func makePoint(name string, timestamp time.Time, value interface{}) *kairosdbMetric {
 	return &kairosdbMetric{
-    Timestamp: msTime(timestamp),
-		Name: name,
-		Value: value,
+		Timestamp: msTime(timestamp),
+		Name:      name,
+		Value:     value,
 	}
 }
 
-// Adds additional tags to the existing tags of a point
-func addTagsToPoint(point *kairosdbMetric, tags map[string]string) {
-	if point.Tags == nil {
-		point.Tags = tags
+// Set tags and timestamp for all points of the batch.
+func (self *kairosdbStorage) tagPoints(ref info.ContainerReference, stats *info.ContainerStats, points []*kairosdbMetric) {
+	var containerName string
+	var envs map[string]string
+	var err error
+	// Use container alias if possible
+	if len(ref.Aliases) > 0 {
+		containerName = ref.Aliases[0]
 	} else {
-		for k, v := range tags {
-			point.Tags[k] = v
-		}
+		containerName = ref.Name
 	}
-}
 
-func (self *kairosdbStorage) Close() error {
-	self.httpClient = nil
-	return nil
+	client, err := client.NewClient("http://localhost:8000/")
+	if err != nil {
+		glog.Errorf("tried to make client and got error %v", err)
+	}
+
+	sInfo, err := client.ContainerInfo(ref.Name, &info.ContainerInfoRequest{NumStats: 1})
+	if err != nil {
+		glog.Errorf("couldn't get container info for %s: %v", ref.Name, err)
+	} else {
+		envs = sInfo.Spec.Envs
+	}
+
+	commonTags := map[string]string{
+		tagMachineName:   self.machineName,
+		tagContainerName: containerName,
+	}
+	for i := 0; i < len(points); i++ {
+		// merge with existing tags if any
+		addTagsToPoint(points[i], commonTags)
+		addTagsToPoint(points[i], ref.Labels)
+		addTagsToPoint(points[i], envs)
+	}
 }
