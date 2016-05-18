@@ -39,7 +39,6 @@ var argIp = flag.String("listen_ip", "", "IP to listen on, defaults to all IPs")
 var argPort = flag.Int("port", 8080, "port to listen")
 var maxProcs = flag.Int("max_procs", 0, "max number of CPUs that can be used simultaneously. Less than 1 for default (number of cores).")
 
-var argDbDriver = flag.String("storage_driver", "", "storage driver to use. Data is always cached shortly in memory, this controls where data is pushed besides the local cache. Empty means none. Options are: <empty> (default), bigquery, influxdb, kafka and kairosdb")
 var versionFlag = flag.Bool("version", false, "print cAdvisor version and exit")
 
 var httpAuthFile = flag.String("http_auth_file", "", "HTTP auth file for the web UI")
@@ -72,11 +71,15 @@ type metricSetValue struct {
 }
 
 func (ml *metricSetValue) String() string {
-	return fmt.Sprint(*ml)
+	var values []string
+	for metric, _ := range ml.MetricSet {
+		values = append(values, string(metric))
+	}
+	return strings.Join(values, ",")
 }
 
 func (ml *metricSetValue) Set(value string) error {
-	ignoreMetrics = metricSetValue{}
+	ml.MetricSet = container.MetricSet{}
 	if value == "" {
 		return nil
 	}
@@ -91,7 +94,7 @@ func (ml *metricSetValue) Set(value string) error {
 }
 
 func init() {
-	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of metrics to be disabled. Options are `disk`, `network`, `tcp`. Note: tcp is disabled by default due to high CPU usage.")
+	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of `metrics` to be disabled. Options are 'disk', 'network', 'tcp'. Note: tcp is disabled by default due to high CPU usage.")
 }
 
 func main() {
@@ -105,9 +108,9 @@ func main() {
 
 	setMaxProcs()
 
-	memoryStorage, err := NewMemoryStorage(*argDbDriver)
+	memoryStorage, err := NewMemoryStorage()
 	if err != nil {
-		glog.Fatalf("Failed to connect to database: %s", err)
+		glog.Fatalf("Failed to initialize storage driver: %s", err)
 	}
 
 	sysFs, err := sysfs.NewRealSysFs()
