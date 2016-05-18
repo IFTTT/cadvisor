@@ -158,7 +158,8 @@ func (self *kairosdbStorage) AddStats(ref info.ContainerReference, stats *info.C
 		b, _ := json.Marshal(points)
 		resp, err := self.httpClient.Post(self.url.String(), "application/json", bytes.NewBuffer(b))
 		if err != nil || resp.StatusCode != 204 {
-			return fmt.Errorf("failed to write stats to kairosDb - %s", err)
+			body, _ := ioutil.ReadAll(resp.Body)
+			return fmt.Errorf("failed to write stats to kairosDb - %s (status: %d)", body, resp.StatusCode)
 		}
 		defer resp.Body.Close()
 	}
