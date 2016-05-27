@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-        "io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -159,8 +158,7 @@ func (self *kairosdbStorage) AddStats(ref info.ContainerReference, stats *info.C
 		b, _ := json.Marshal(points)
 		resp, err := self.httpClient.Post(self.url.String(), "application/json", bytes.NewBuffer(b))
 		if err != nil || resp.StatusCode != 204 {
-			body, _ := ioutil.ReadAll(resp.Body)
-			return fmt.Errorf("failed to write stats to kairosDb - %s (status: %d)", body, resp.StatusCode)
+			return fmt.Errorf("failed to write stats to kairosDb - status: %d", resp.StatusCode)
 		}
 		defer resp.Body.Close()
 	}
